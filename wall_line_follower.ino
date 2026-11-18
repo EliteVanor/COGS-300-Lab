@@ -19,9 +19,6 @@
 //   Nothing found after both sweeps -> back to WALL MODE.
 //   Only the side ultrasonic runs in line mode, so the control loop stays fast.
 //   All line speeds are scaled by LINE_SLOW.
-//   Turn slowdown: a hard turn (side sensor only) or a pivot makes the cruise speed
-//            (TRACK and CREEP) LINE_TURN_SLOW times normal, until LINE_TURN_SLOW_MS
-//            after the turn ends. Another turn restarts the timer. It never stacks.
 //
 // Wheels never reverse (a single-channel encoder cannot tell direction).
 // Speeds are in encoder ticks per second. Each wheel is feedforward + PI.
@@ -107,8 +104,6 @@ const float TICKS_PER_90    = 30.0;      // outer-wheel ticks for a 90 degree pi
 const float SEARCH1_DEG     = 220.0;     // first sweep, toward the side the line was last seen
 const float SEARCH2_DEG     = 400.0;     // second sweep, the other way (undoes the first, then 180 more)
 const float LINE_SLOW       = 0.8;       // all line-mode speeds are multiplied by this (0.7 = 30% slower)
-const float LINE_TURN_SLOW  = 0.7;       // cruise speed multiplier after a turn (0.7 = 30% slower). Does not stack.
-const unsigned long LINE_TURN_SLOW_MS = 2000;  // how long the turn slowdown lasts after the turn ends
 const int   LINE_TO_WALL_LOOPS = 2;      // side wall seen this many line loops in a row -> wall mode
 
 // ===================================================================================================
@@ -139,8 +134,6 @@ int   searchPhase = 1;
 unsigned long markTicks = 0;
 int   enterCount = 0;
 int   wallCount = 0;              // line mode: side wall readings in a row
-bool  turnSeen = false;           // a turn happened since entering line mode
-unsigned long turnMs = 0;         // millis() of the last loop that was turning
 
 // ---------- Encoder state (ISR writes, loop reads with interrupts off) ----------
 volatile unsigned long lastTickL = 0, lastTickR = 0;
@@ -248,7 +241,6 @@ void enterLineMode() {
   lastPos = 0;
   enterCount = 0;
   wallCount = 0;
-  turnSeen = false;
 }
 
 // Back to the wall follower with fresh state.
@@ -271,12 +263,6 @@ void startSearch(int dir, int phase) {
   lineState = LT_SEARCH;
 }
 
-// Cruise multiplier: LINE_TURN_SLOW until LINE_TURN_SLOW_MS after the last turn, else 1.
-// The timer only restarts, so back-to-back turns never slow the car more than once.
-float turnFactor() {
-  return (turnSeen && millis() - turnMs < LINE_TURN_SLOW_MS) ? LINE_TURN_SLOW : 1.0;
-}
-
 void lineStep(uint8_t ir, float dt) {
   bool L = ir & _BV(IR_L_BIT);
   bool M = ir & _BV(IR_M_BIT);
@@ -297,14 +283,11 @@ void lineStep(uint8_t ir, float dt) {
     lastPos = pos;
     lineState = LT_TRACK;
 
-    if (fabs(pos) > 0.75) { turnSeen = true; turnMs = millis(); }   // hard turn: side sensor only
-
     float base = (pos == 0) ? LINE_TPS : LINE_EDGE_TPS;
     float k = (fabs(pos) > 0.75) ? LINE_STEER_SIDE : (fabs(pos) > 0.25) ? LINE_STEER_HALF : 0.0;
     float steer = (pos > 0 ? 1.0 : -1.0) * k * base;     // + = steer left
-    float f = LINE_SLOW * turnFactor();                    // both wheels scaled, so the curve stays the same
-    tl = (base - steer) * f;
-    tr = (base + steer) * f;
+    tl = (base - steer) * LINE_SLOW;
+    tr = (base + steer) * LINE_SLOW;
   } else {
     if (lineState == LT_TRACK) {
       if (lastPos != 0) {
@@ -317,11 +300,10 @@ void lineStep(uint8_t ir, float dt) {
 
     if (lineState == LT_CREEP) {
       if ((ticksOf(true) + ticksOf(false)) / 2 - markTicks >= LINE_CREEP_TICKS) startSearch(lastSide, 1);
-      else { tl = LINE_EDGE_TPS * LINE_SLOW * turnFactor(); tr = tl; }
+      else { tl = LINE_EDGE_TPS * LINE_SLOW; tr = LINE_EDGE_TPS * LINE_SLOW; }
     }
 
     if (lineState == LT_SEARCH) {
-      turnSeen = true; turnMs = millis();       // pivoting counts as turning
       float deg = (ticksOf(searchDir < 0) - markTicks) * 90.0 / TICKS_PER_90;
       if (deg >= (searchPhase == 1 ? SEARCH1_DEG : SEARCH2_DEG)) {
         if (searchPhase == 1) startSearch(-searchDir, 2);
@@ -338,7 +320,6 @@ void lineStep(uint8_t ir, float dt) {
     printCount = 0;
     Serial.print(lineState == LT_TRACK ? "L_TRACK" : lineState == LT_CREEP ? "L_CREEP" :
                  searchDir > 0 ? "L_PIVOT_L" : "L_PIVOT_R");
-    if (turnFactor() < 1.0) Serial.print("_SLOW");
     Serial.print(" IR:"); Serial.print(L); Serial.print(M); Serial.print(R);
     Serial.print(" pos:"); Serial.print(lastPos);
     Serial.print(" tL:"); Serial.print(tl);
